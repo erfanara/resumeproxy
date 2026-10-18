@@ -1,0 +1,171 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 392" width="820" height="392" role="img" aria-labelledby="t d">
+<title id="t">Normal proxy tunnel vs resumeproxy tunnel</title>
+<desc id="d">Two downloads through a proxy. The tunnel TCP connection dies in both at the same moment. With a normal proxy the app's connection is reset and the download is lost. With resumeproxy the app only sees a pause: the client redials, both sides resend the unacknowledged bytes from the peer's offset, and the download completes intact.</desc>
+<style>
+  svg {
+    --card: #f6f8fa; --box: #ffffff; --line: #d0d7de; --text: #1f2328; --muted: #59636e;
+    --green: #1a7f37; --amber: #9a6700; --red: #cf222e; --blue: #0969da; --track: #e1e4e8;
+    font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    svg {
+      --card: #161b22; --box: #0d1117; --line: #30363d; --text: #e6edf3; --muted: #9198a1;
+      --green: #3fb950; --amber: #d29922; --red: #f85149; --blue: #58a6ff; --track: #30363d;
+    }
+  }
+  .card { fill: var(--card); }
+  .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+  .box.rp { stroke: var(--blue); }
+  .outline { fill: none; stroke: var(--red); stroke-width: 2.5; }
+  .title { fill: var(--text); font-size: 15px; font-weight: 700; }
+  .name { fill: var(--text); font-size: 13px; font-weight: 600; text-anchor: middle; }
+  .sub, .lbl { fill: var(--muted); font-size: 11px; text-anchor: middle; }
+  .status { font-size: 13px; text-anchor: end; }
+  .note { font-size: 12px; text-anchor: middle; }
+  .muted { fill: var(--muted); } .ok { fill: var(--green); } .warn { fill: var(--amber); } .bad { fill: var(--red); }
+  .ln { fill: none; stroke-width: 3; stroke-linecap: round; }
+  .s-ok { stroke: var(--green); } .s-warn { stroke: var(--amber); } .s-bad { stroke: var(--red); stroke-dasharray: 6 6; }
+  .x { stroke: var(--red); stroke-width: 3; stroke-linecap: round; }
+  .pkt { fill: var(--blue); }
+  .track { fill: var(--track); }
+  .bar { transform-box: fill-box; transform-origin: 0 0; }
+  .bar.ok { fill: var(--green); } .bar.warn { fill: var(--amber); } .bar.bad { fill: var(--red); }
+
+  /* One 14 s timeline: tunnel dies at 30%, normal proxy resets the app at 36%,
+     resumeproxy redials at 43%, resumes at 56% and finishes at 88%.
+     The static opacity/transform of each class is the final frame, which is
+     what readers who prefer reduced motion see. */
+  .v-0-cut         { opacity: 0; animation: v-0-cut 14s linear infinite; }
+  .v-cut-end       { opacity: 1; animation: v-cut-end 14s linear infinite; }
+  .v-0-reset       { opacity: 0; animation: v-0-reset 14s linear infinite; }
+  .v-reset-end     { opacity: 1; animation: v-reset-end 14s linear infinite; }
+  .v-cut-reset     { opacity: 0; animation: v-cut-reset 14s linear infinite; }
+  .v-out           { opacity: 0; animation: v-out 14s linear infinite; }
+  .v-alive         { opacity: 1; animation: v-alive 14s linear infinite; }
+  .v-cut-redial    { opacity: 0; animation: v-cut-redial 14s linear infinite; }
+  .v-redial-resume { opacity: 0; animation: v-redial-resume 14s linear infinite; }
+  .v-resume-done   { opacity: 0; animation: v-resume-done 14s linear infinite; }
+  .v-done          { opacity: 1; animation: v-done 14s linear infinite; }
+  .p-top     { transform: scaleX(.35); animation: p-top 14s linear infinite; }
+  .p-top-bad { transform: scaleX(.35); animation: p-top 14s linear infinite, v-reset-end 14s linear infinite; }
+  .p-bot     { transform: scaleX(1); animation: p-bot 14s linear infinite; }
+  .p-bot-out { transform: scaleX(1); opacity: 0; animation: p-bot 14s linear infinite, v-out 14s linear infinite; }
+  .pkt-top { opacity: 0; animation: move 2.4s linear infinite, v-0-cut 14s linear infinite; }
+  .pkt-bot { opacity: 0; animation: move 2.4s linear infinite, v-flow 14s linear infinite; }
+
+  @keyframes v-0-cut         { 0%, 29.3% { opacity: 1 } 30%, 100% { opacity: 0 } }
+  @keyframes v-cut-end       { 0%, 29.3% { opacity: 0 } 30%, 100% { opacity: 1 } }
+  @keyframes v-0-reset       { 0%, 35.3% { opacity: 1 } 36%, 100% { opacity: 0 } }
+  @keyframes v-reset-end     { 0%, 35.3% { opacity: 0 } 36%, 100% { opacity: 1 } }
+  @keyframes v-cut-reset     { 0%, 29.3% { opacity: 0 } 30%, 35.3% { opacity: 1 } 36%, 100% { opacity: 0 } }
+  @keyframes v-out           { 0%, 29.3% { opacity: 0 } 30%, 55.3% { opacity: 1 } 56%, 100% { opacity: 0 } }
+  @keyframes v-alive         { 0%, 29.3% { opacity: 1 } 30%, 55.3% { opacity: 0 } 56%, 100% { opacity: 1 } }
+  @keyframes v-flow          { 0%, 29.3% { opacity: 1 } 30%, 55.3% { opacity: 0 } 56%, 87.3% { opacity: 1 } 88%, 100% { opacity: 0 } }
+  @keyframes v-cut-redial    { 0%, 29.3% { opacity: 0 } 30%, 42.3% { opacity: 1 } 43%, 100% { opacity: 0 } }
+  @keyframes v-redial-resume { 0%, 42.3% { opacity: 0 } 43%, 55.3% { opacity: 1 } 56%, 100% { opacity: 0 } }
+  @keyframes v-resume-done   { 0%, 55.3% { opacity: 0 } 56%, 87.3% { opacity: 1 } 88%, 100% { opacity: 0 } }
+  @keyframes v-done          { 0%, 87.3% { opacity: 0 } 88%, 100% { opacity: 1 } }
+  @keyframes p-top { 0% { transform: scaleX(0) } 30%, 100% { transform: scaleX(.35) } }
+  @keyframes p-bot { 0% { transform: scaleX(0) } 30%, 56% { transform: scaleX(.35) } 88%, 100% { transform: scaleX(1) } }
+  @keyframes move  { from { transform: translateX(0) } to { transform: translateX(-660px) } }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style>
+
+<!-- ============ Normal proxy tunnel ============ -->
+<rect class="card" x="8" y="8" width="804" height="180" rx="12"/>
+<text class="title" x="28" y="38">Normal proxy tunnel</text>
+<text class="status muted v-0-cut" x="792" y="38">downloading…</text>
+<text class="status bad v-cut-reset" x="792" y="38">the tunnel's TCP connection dies</text>
+<text class="status bad v-reset-end" x="792" y="38">✗ app connection reset: download lost</text>
+
+<text class="lbl" x="172" y="73">local TCP</text>
+<text class="lbl" x="410" y="73">tunnel TCP</text>
+<text class="lbl" x="648" y="73">TCP</text>
+<line class="ln s-ok v-0-reset" x1="132" y1="84" x2="212" y2="84"/>
+<line class="ln s-bad v-reset-end" x1="132" y1="84" x2="212" y2="84"/>
+<line class="ln s-ok v-0-cut" x1="336" y1="84" x2="484" y2="84"/>
+<line class="ln s-bad v-cut-end" x1="336" y1="84" x2="484" y2="84"/>
+<line class="ln s-ok v-0-reset" x1="608" y1="84" x2="688" y2="84"/>
+<line class="ln s-bad v-reset-end" x1="608" y1="84" x2="688" y2="84"/>
+<g class="v-cut-end"><line class="x" x1="404" y1="78" x2="416" y2="90"/><line class="x" x1="416" y1="78" x2="404" y2="90"/></g>
+
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -0.00s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -0.24s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -0.48s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -0.72s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -0.96s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -1.20s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -1.44s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -1.68s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -1.92s, 0s"/>
+<circle class="pkt pkt-top" cx="740" cy="84" r="4.5" style="animation-delay: -2.16s, 0s"/>
+
+<rect class="box" x="28" y="60" width="104" height="48" rx="8"/>
+<rect class="outline v-reset-end" x="28" y="60" width="104" height="48" rx="8"/>
+<text class="name" x="80" y="80">App</text><text class="sub" x="80" y="97">curl</text>
+<rect class="box" x="212" y="60" width="124" height="48" rx="8"/>
+<text class="name" x="274" y="80">proxy</text><text class="sub" x="274" y="97">client</text>
+<rect class="box" x="484" y="60" width="124" height="48" rx="8"/>
+<text class="name" x="546" y="80">proxy</text><text class="sub" x="546" y="97">server</text>
+<rect class="box" x="688" y="60" width="104" height="48" rx="8"/>
+<text class="name" x="740" y="80">Target</text><text class="sub" x="740" y="97">web server</text>
+
+<text class="note bad v-reset-end" x="80" y="132">✗ connection reset</text>
+<text class="note bad v-cut-end" x="410" y="132">in-flight bytes are lost</text>
+
+<text class="lbl" x="28" y="165" style="text-anchor: start">download</text>
+<rect class="track" x="96" y="158" width="696" height="8" rx="4"/>
+<rect class="bar ok p-top" x="96" y="158" width="696" height="8" rx="4"/>
+<rect class="bar bad p-top-bad" x="96" y="158" width="696" height="8" rx="4"/>
+
+<!-- ============ resumeproxy tunnel ============ -->
+<rect class="card" x="8" y="204" width="804" height="180" rx="12"/>
+<text class="title" x="28" y="234">resumeproxy tunnel</text>
+<text class="status muted v-0-cut" x="792" y="234">downloading…</text>
+<text class="status warn v-out" x="792" y="234">the tunnel dies: the app only sees a pause</text>
+<text class="status ok v-resume-done" x="792" y="234">✓ new tunnel: bytes continue where they stopped</text>
+<text class="status ok v-done" x="792" y="234">✓ download complete: nothing lost or duplicated</text>
+
+<text class="lbl" x="172" y="269">local TCP</text>
+<text class="lbl" x="410" y="269">tunnel TCP</text>
+<text class="lbl" x="648" y="269">TCP</text>
+<line class="ln s-ok" x1="132" y1="280" x2="212" y2="280"/>
+<line class="ln s-warn v-out" x1="132" y1="280" x2="212" y2="280"/>
+<line class="ln s-ok v-alive" x1="336" y1="280" x2="484" y2="280"/>
+<line class="ln s-bad v-out" x1="336" y1="280" x2="484" y2="280"/>
+<line class="ln s-ok" x1="608" y1="280" x2="688" y2="280"/>
+<line class="ln s-warn v-out" x1="608" y1="280" x2="688" y2="280"/>
+<g class="v-out"><line class="x" x1="404" y1="274" x2="416" y2="286"/><line class="x" x1="416" y1="274" x2="404" y2="286"/></g>
+
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -0.00s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -0.24s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -0.48s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -0.72s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -0.96s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -1.20s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -1.44s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -1.68s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -1.92s, 0s"/>
+<circle class="pkt pkt-bot" cx="740" cy="280" r="4.5" style="animation-delay: -2.16s, 0s"/>
+
+<rect class="box" x="28" y="256" width="104" height="48" rx="8"/>
+<text class="name" x="80" y="276">App</text><text class="sub" x="80" y="293">curl</text>
+<rect class="box rp" x="212" y="256" width="124" height="48" rx="8"/>
+<text class="name" x="274" y="276">resumeproxy</text><text class="sub" x="274" y="293">client</text>
+<rect class="box rp" x="484" y="256" width="124" height="48" rx="8"/>
+<text class="name" x="546" y="276">resumeproxy</text><text class="sub" x="546" y="293">server</text>
+<rect class="box" x="688" y="256" width="104" height="48" rx="8"/>
+<text class="name" x="740" y="276">Target</text><text class="sub" x="740" y="293">web server</text>
+
+<text class="note warn v-out" x="80" y="328">paused, still open</text>
+<text class="note ok v-done" x="80" y="328">✓ done</text>
+<text class="note warn v-cut-redial" x="410" y="328">both ends keep their unacked bytes</text>
+<text class="note warn v-redial-resume" x="410" y="328">client redials…</text>
+<text class="note ok v-resume-done" x="410" y="328">resent from the peer's byte offset</text>
+
+<text class="lbl" x="28" y="361" style="text-anchor: start">download</text>
+<rect class="track" x="96" y="354" width="696" height="8" rx="4"/>
+<rect class="bar ok p-bot" x="96" y="354" width="696" height="8" rx="4"/>
+<rect class="bar warn p-bot-out" x="96" y="354" width="696" height="8" rx="4"/>
+</svg>

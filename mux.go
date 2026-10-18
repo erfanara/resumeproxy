@@ -1,0 +1,238 @@
+package main
+
+// Minimal stream multiplexer on top of a Session. It knows nothing about
+// reconnects: the session below simply never fails unless the grace period
+// runs out. That separation is the point of the design: resumption is solved
+// once, for the whole byte stream, instead of per proxied connection.
+//
+// Frame: streamID u32 | type u8 | len u16 | payload
+//
+// Each side sends mFin when its local socket hits EOF (TCP half-close); a
+// stream is freed once both directions are done. mRst kills it at once.
+//
+// PoC limitation: no per-stream flow control, so one local socket that stops
+// reading stalls the other streams of the same session. smux and yamux solve
+// this with per-stream windows; compare them with -mux (libmux.go).
+
+import (
+	"bufio"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"sync"
+)
+
+const (
+	mOpen   = iota // payload: "host:port"
+	mOpenOK        // target connected
+	mData
+	mFin // sender will write no more
+	mRst // stream is gone
+)
+
+type stream struct {
+	conn       net.Conn
+	reply      func(ok bool) // client side, pending until OpenOK/Rst
+	localDone  bool          // we sent mFin (our local socket hit EOF)
+	remoteDone bool          // we received mFin
+}
+
+type Mux struct {
+	sess *Session
+	dial func(addr string) (net.Conn, error) // server side only; nil on the client
+
+	mu      sync.Mutex
+	streams map[uint32]*stream
+	nextID  uint32 // only the client allocates IDs, so no clash with the server
+	dead    bool
+}
+
+func NewMux(s *Session, dial func(string) (net.Conn, error)) *Mux {
+	return &Mux{sess: s, dial: dial, streams: map[uint32]*stream{}}
+}
+
+// send writes one frame. Many pump goroutines call this concurrently; no
+// extra lock is needed because Session.Write appends the whole frame under
+// its own lock, so frames never interleave.
+func (m *Mux) send(id uint32, typ byte, p []byte) error {
+	frame := binary.BigEndian.AppendUint32(make([]byte, 0, 7+len(p)), id)
+	frame = binary.BigEndian.AppendUint16(append(frame, typ), uint16(len(p)))
+	_, err := m.sess.Write(append(frame, p...))
+	return err
+}
+
+// Open asks the server to connect to addr and relays local to it. reply is
+// called exactly once, before any target data is written to local.
+func (m *Mux) Open(addr string, local net.Conn, reply func(ok bool)) error {
+	m.mu.Lock()
+	if m.dead {
+		m.mu.Unlock()
+		return errors.New("session is dead")
+	}
+	m.nextID++
+	id := m.nextID
+	m.streams[id] = &stream{conn: local, reply: reply}
+	m.mu.Unlock()
+	return m.send(id, mOpen, []byte(addr))
+}
+
+func (m *Mux) get(id uint32) *stream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.streams[id]
+}
+
+// Run processes incoming frames until the session dies. It is the only
+// reader of the session, so frames arrive here in order.
+func (m *Mux) Run() error {
+	br := bufio.NewReaderSize(m.sess, 64<<10)
+	var hdr [7]byte
+	buf := make([]byte, 1<<16) // u16 length field: a payload never exceeds this
+	var err error
+	for {
+		if _, err = io.ReadFull(br, hdr[:]); err != nil {
+			break
+		}
+		id := binary.BigEndian.Uint32(hdr[:])
+		p := buf[:binary.BigEndian.Uint16(hdr[5:])]
+		if _, err = io.ReadFull(br, p); err != nil {
+			break
+		}
+		switch hdr[4] {
+		case mOpen:
+			if m.dial != nil { // dialing may be slow: never block the frame loop on it
+				go m.accept(id, string(p))
+			}
+		case mOpenOK:
+			// No lock for st.reply: until pump starts, only this goroutine
+			// touches it, and `go pump` orders the nil-store before pump's reads.
+			if st := m.get(id); st != nil && st.reply != nil {
+				st.reply(true)
+				st.reply = nil
+				go m.pump(id, st)
+			}
+		case mData:
+			// A blocking write here is the "no per-stream flow control"
+			// limitation: a slow local reader stalls the whole session.
+			if st := m.get(id); st != nil {
+				if _, werr := st.conn.Write(p); werr != nil {
+					m.reset(id, true)
+				}
+			}
+		case mFin:
+			// Peer finished sending: half-close our local socket so the app
+			// sees EOF while it can still write its own remaining data.
+			if st := m.get(id); st != nil {
+				if cw, ok := st.conn.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+				m.finish(id, false)
+			}
+		case mRst:
+			m.reset(id, false)
+		}
+	}
+	// The session died for good (grace expired or protocol error): tear
+	// down every stream so local apps see their connection close.
+	m.sess.closeWith(err)
+	m.mu.Lock()
+	m.dead = true
+	all := m.streams
+	m.streams = map[uint32]*stream{}
+	m.mu.Unlock()
+	for _, st := range all {
+		closeStream(st)
+	}
+	return err
+}
+
+// closeStream tells a still-pending SOCKS client "refused", then closes.
+func closeStream(st *stream) {
+	if st.reply != nil {
+		st.reply(false)
+	}
+	st.conn.Close()
+}
+
+// accept runs on the server for each mOpen.
+func (m *Mux) accept(id uint32, addr string) {
+	c, err := m.dial(addr)
+	if err != nil {
+		m.send(id, mRst, nil)
+		return
+	}
+	st := &stream{conn: c}
+	m.mu.Lock()
+	if m.dead { // session died while we were dialing
+		m.mu.Unlock()
+		c.Close()
+		return
+	}
+	m.streams[id] = st
+	m.mu.Unlock()
+	if m.send(id, mOpenOK, nil) == nil {
+		m.pump(id, st)
+	}
+}
+
+// pump copies local socket -> session. During an outage send blocks once the
+// retransmit buffer is full, so we stop reading and the app sees backpressure.
+func (m *Mux) pump(id uint32, st *stream) {
+	buf := make([]byte, maxChunk)
+	for {
+		n, err := st.conn.Read(buf)
+		if n > 0 && m.send(id, mData, buf[:n]) != nil {
+			return // session dead; Run closes everything
+		}
+		if err == io.EOF { // clean half-close from the app
+			m.send(id, mFin, nil)
+			m.finish(id, true)
+			return
+		}
+		if err != nil { // local socket broke or was closed by reset
+			m.reset(id, true)
+			return
+		}
+	}
+}
+
+// finish marks one direction as done; the stream is released when both are.
+func (m *Mux) finish(id uint32, local bool) {
+	m.mu.Lock()
+	st := m.streams[id]
+	if st == nil {
+		m.mu.Unlock()
+		return
+	}
+	if local {
+		st.localDone = true
+	} else {
+		st.remoteDone = true
+	}
+	done := st.localDone && st.remoteDone
+	if done {
+		delete(m.streams, id)
+	}
+	m.mu.Unlock()
+	if done {
+		st.conn.Close()
+	}
+}
+
+// reset kills a stream now. notify: also tell the peer (false when the peer
+// is the one who sent mRst). Removing it from the map first makes reset
+// idempotent, so the pump and the frame loop can both call it safely.
+func (m *Mux) reset(id uint32, notify bool) {
+	m.mu.Lock()
+	st := m.streams[id]
+	delete(m.streams, id)
+	m.mu.Unlock()
+	if st == nil {
+		return
+	}
+	closeStream(st)
+	if notify {
+		go m.send(id, mRst, nil) // async: never block the frame loop on a full buffer
+	}
+}
