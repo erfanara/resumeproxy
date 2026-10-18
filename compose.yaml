@@ -1,0 +1,17 @@
+# Server and client on one host, for trying it out. In real use, run the
+# server service on the remote host and point the client's -server at it.
+services:
+  server:
+    build: .
+    image: ghcr.io/erfanara/resumeproxy:latest
+    command: ["-mode", "server", "-listen", ":9000"]
+    ports: ["9000:9000"]
+    restart: unless-stopped
+
+  client:
+    build: .
+    image: ghcr.io/erfanara/resumeproxy:latest
+    command: ["-mode", "client", "-listen", ":1080", "-server", "server:9000"]
+    ports: ["127.0.0.1:1080:1080"]
+    depends_on: [server]
+    restart: unless-stopped
