@@ -1,4 +1,4 @@
-# ResumeProxy
+# ResumeProxy: Transparent TCP Session Recovery
 
 An educational proof of concept: a SOCKS5 proxy whose client↔server tunnel
 **survives TCP connection loss without closing the local connections**.
