@@ -29,6 +29,8 @@ const (
 	mData
 	mFin // sender will write no more
 	mRst // stream is gone
+
+	mHdrLen = 7 // streamID u32 | type u8 | len u16
 )
 
 type stream struct {
@@ -52,13 +54,21 @@ func NewMux(s *Session, dial func(string) (net.Conn, error)) *Mux {
 	return &Mux{sess: s, dial: dial, streams: map[uint32]*stream{}}
 }
 
-// send writes one frame. Many pump goroutines call this concurrently; no
-// extra lock is needed because Session.Write appends the whole frame under
-// its own lock, so frames never interleave.
+// send writes one frame with payload p.
 func (m *Mux) send(id uint32, typ byte, p []byte) error {
-	frame := binary.BigEndian.AppendUint32(make([]byte, 0, 7+len(p)), id)
-	frame = binary.BigEndian.AppendUint16(append(frame, typ), uint16(len(p)))
-	_, err := m.sess.Write(append(frame, p...))
+	return m.sendFrame(id, typ, append(make([]byte, mHdrLen, mHdrLen+len(p)), p...))
+}
+
+// sendFrame fills in the header of frame, whose first mHdrLen bytes are
+// reserved for it, and writes it. Many pump goroutines call this
+// concurrently; no extra lock is needed because Session.Write appends the
+// whole frame under its own lock, so frames never interleave. Session.Write
+// copies frame, so the caller may reuse it right away.
+func (m *Mux) sendFrame(id uint32, typ byte, frame []byte) error {
+	binary.BigEndian.PutUint32(frame, id)
+	frame[4] = typ
+	binary.BigEndian.PutUint16(frame[5:], uint16(len(frame)-mHdrLen))
+	_, err := m.sess.Write(frame)
 	return err
 }
 
@@ -87,7 +97,7 @@ func (m *Mux) get(id uint32) *stream {
 // reader of the session, so frames arrive here in order.
 func (m *Mux) Run() error {
 	br := bufio.NewReaderSize(m.sess, 64<<10)
-	var hdr [7]byte
+	var hdr [mHdrLen]byte
 	buf := make([]byte, 1<<16) // u16 length field: a payload never exceeds this
 	var err error
 	for {
@@ -179,10 +189,11 @@ func (m *Mux) accept(id uint32, addr string) {
 // pump copies local socket -> session. During an outage send blocks once the
 // retransmit buffer is full, so we stop reading and the app sees backpressure.
 func (m *Mux) pump(id uint32, st *stream) {
-	buf := make([]byte, maxChunk)
+	// Room for the header in front of the data: no allocation per frame.
+	buf := make([]byte, mHdrLen+maxChunk)
 	for {
-		n, err := st.conn.Read(buf)
-		if n > 0 && m.send(id, mData, buf[:n]) != nil {
+		n, err := st.conn.Read(buf[mHdrLen:])
+		if n > 0 && m.sendFrame(id, mData, buf[:mHdrLen+n]) != nil {
 			return // session dead; Run closes everything
 		}
 		if err == io.EOF { // clean half-close from the app

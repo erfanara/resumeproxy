@@ -23,6 +23,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
@@ -89,14 +90,16 @@ type Session struct {
 
 	// send side: sendBuf holds bytes [sendBase, sendBase+len), i.e. everything
 	// not yet acknowledged. sendNext is the next offset to put on the wire.
-	sendBuf  []byte
+	// Both buffers are bytes.Buffer, not plain slices, because it reuses its
+	// array as bytes are consumed from the front instead of reallocating.
+	sendBuf  bytes.Buffer
 	sendBase uint64
 	sendNext uint64
 	ackDue   bool // we received data the peer has not heard an ACK for yet
 	pingDue  bool // heartbeat tick: send something so the peer's read deadline resets
 
 	// receive side
-	recvBuf []byte
+	recvBuf bytes.Buffer
 	recvOff uint64 // total bytes received in order
 
 	conn net.Conn // current tunnel, nil while detached
@@ -119,14 +122,13 @@ func newSession(cfg Config, id, token [16]byte) *Session {
 func (s *Session) Read(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for len(s.recvBuf) == 0 {
+	for s.recvBuf.Len() == 0 {
 		if s.err != nil {
 			return 0, s.err
 		}
 		s.cond.Wait()
 	}
-	n := copy(p, s.recvBuf)
-	s.recvBuf = s.recvBuf[n:]
+	n, _ := s.recvBuf.Read(p)
 	s.cond.Broadcast() // room freed: wakes a readLoop blocked on a full recvBuf
 	return n, nil
 }
@@ -139,13 +141,13 @@ func (s *Session) Write(p []byte) (int, error) {
 	defer s.mu.Unlock()
 	// An empty buffer always accepts p, even one larger than MaxBuf; otherwise
 	// such a write would wait forever.
-	for s.err == nil && len(s.sendBuf) > 0 && len(s.sendBuf)+len(p) > s.cfg.MaxBuf {
+	for s.err == nil && s.sendBuf.Len() > 0 && s.sendBuf.Len()+len(p) > s.cfg.MaxBuf {
 		s.cond.Wait()
 	}
 	if s.err != nil {
 		return 0, s.err
 	}
-	s.sendBuf = append(s.sendBuf, p...)
+	s.sendBuf.Write(p)
 	s.cond.Broadcast() // wakes writeLoop
 	return len(p), nil
 }
@@ -219,7 +221,7 @@ func (s *Session) quiesce() uint64 {
 func (s *Session) drop(gen uint64) {
 	s.mu.Lock()
 	if s.gen == gen && s.err == nil {
-		s.cfg.Logf("session %x: tunnel lost, %d bytes unacked, local connections kept", s.id[:4], len(s.sendBuf))
+		s.cfg.Logf("session %x: tunnel lost, %d bytes unacked, local connections kept", s.id[:4], s.sendBuf.Len())
 		s.detachLocked()
 	}
 	s.mu.Unlock()
@@ -237,10 +239,10 @@ func (s *Session) waitDetached() error {
 // ackToLocked frees every byte below off: the peer has it, so it will never
 // need a retransmit. Offsets outside the buffer are stale or bogus and ignored.
 func (s *Session) ackToLocked(off uint64) {
-	if off <= s.sendBase || off > s.sendBase+uint64(len(s.sendBuf)) {
+	if off <= s.sendBase || off > s.sendBase+uint64(s.sendBuf.Len()) {
 		return
 	}
-	s.sendBuf = s.sendBuf[off-s.sendBase:]
+	s.sendBuf.Next(int(off - s.sendBase))
 	s.sendBase = off
 	if s.sendNext < off {
 		s.sendNext = off
@@ -258,7 +260,7 @@ func (s *Session) attach(c net.Conn, peerRecv uint64) error {
 		return s.err
 	}
 	// We can only resume if we still hold every byte the peer is missing.
-	if peerRecv < s.sendBase || peerRecv > s.sendBase+uint64(len(s.sendBuf)) {
+	if peerRecv < s.sendBase || peerRecv > s.sendBase+uint64(s.sendBuf.Len()) {
 		c.Close()
 		return errors.New("peer resume offset is outside the retransmit buffer")
 	}
@@ -271,7 +273,7 @@ func (s *Session) attach(c net.Conn, peerRecv uint64) error {
 	s.conn = c
 	s.attaches++
 	s.ackDue, s.pingDue = true, false
-	s.cfg.Logf("session %x: tunnel attached (#%d), replaying %d bytes", s.id[:4], s.attaches, len(s.sendBuf))
+	s.cfg.Logf("session %x: tunnel attached (#%d), replaying %d bytes", s.id[:4], s.attaches, s.sendBuf.Len())
 	gen := s.gen
 	go s.readLoop(c, gen)
 	go s.writeLoop(c, gen)
@@ -321,14 +323,14 @@ func (s *Session) readLoop(c net.Conn, gen uint64) {
 			// Receive-side backpressure: wait for Read to drain recvBuf.
 			// Meanwhile we stop reading the socket, so TCP flow control
 			// slows the peer down.
-			for s.gen == gen && len(s.recvBuf) >= s.cfg.MaxBuf {
+			for s.gen == gen && s.recvBuf.Len() >= s.cfg.MaxBuf {
 				s.cond.Wait()
 			}
 			if s.gen != gen { // tunnel was replaced: peer will resend this
 				s.mu.Unlock()
 				return
 			}
-			s.recvBuf = append(s.recvBuf, buf[:n]...)
+			s.recvBuf.Write(buf[:n])
 			s.recvOff += uint64(n)
 			s.ackDue = true
 			s.cond.Broadcast()
@@ -347,7 +349,7 @@ func (s *Session) writeLoop(c net.Conn, gen uint64) {
 	out := make([]byte, 0, maxChunk+16)
 	for {
 		s.mu.Lock()
-		for s.gen == gen && !s.ackDue && !s.pingDue && s.sendNext == s.sendBase+uint64(len(s.sendBuf)) {
+		for s.gen == gen && !s.ackDue && !s.pingDue && s.sendNext == s.sendBase+uint64(s.sendBuf.Len()) {
 			s.cond.Wait()
 		}
 		if s.gen != gen {
@@ -360,7 +362,7 @@ func (s *Session) writeLoop(c net.Conn, gen uint64) {
 			out = binary.BigEndian.AppendUint64(out, s.recvOff)
 			s.ackDue = false
 		}
-		if pending := s.sendBuf[s.sendNext-s.sendBase:]; len(pending) > 0 {
+		if pending := s.sendBuf.Bytes()[s.sendNext-s.sendBase:]; len(pending) > 0 {
 			pending = pending[:min(len(pending), maxChunk)]
 			out = append(out, frData, byte(len(pending)>>8), byte(len(pending)))
 			out = append(out, pending...)
