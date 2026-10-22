@@ -10,9 +10,14 @@ package main
 // Each side sends mFin when its local socket hits EOF (TCP half-close); a
 // stream is freed once both directions are done. mRst kills it at once.
 //
+// Every stream has a writer goroutine: Run only queues peer data, so local
+// writes of different streams run at the same time, and each write takes
+// everything that piled up.
+//
 // PoC limitation: no per-stream flow control, so one local socket that stops
-// reading stalls the other streams of the same session. smux and yamux solve
-// this with per-stream windows; compare them with -mux (libmux.go).
+// reading stalls the other streams of the same session once its queue is
+// full (maxStreamBuf). smux and yamux solve this with per-stream windows;
+// compare them with -mux (libmux.go).
 
 import (
 	"bufio"
@@ -30,14 +35,54 @@ const (
 	mFin // sender will write no more
 	mRst // stream is gone
 
-	mHdrLen = 7 // streamID u32 | type u8 | len u16
+	mHdrLen      = 7         // streamID u32 | type u8 | len u16
+	maxPayload   = 1<<16 - 1 // largest payload the u16 length field allows
+	maxStreamBuf = 256 << 10 // peer data queued per stream before Run blocks
 )
 
 type stream struct {
 	conn       net.Conn
 	reply      func(ok bool) // client side, pending until OpenOK/Rst
 	localDone  bool          // we sent mFin (our local socket hit EOF)
-	remoteDone bool          // we received mFin
+	remoteDone bool          // the writer passed on the peer's mFin
+
+	// Peer data for the writer goroutine to write to conn.
+	mu   sync.Mutex
+	cond *sync.Cond
+	out  []byte
+	fin  bool // peer sent mFin: half-close conn once out is written
+	dead bool // reset or session gone: drop out, writer exits
+}
+
+func newStream(conn net.Conn, reply func(ok bool)) *stream {
+	st := &stream{conn: conn, reply: reply}
+	st.cond = sync.NewCond(&st.mu)
+	return st
+}
+
+// push queues peer data for the writer, blocking while the queue is full.
+func (st *stream) push(p []byte) {
+	st.mu.Lock()
+	for len(st.out) >= maxStreamBuf && !st.dead {
+		st.cond.Wait()
+	}
+	if !st.dead {
+		st.out = append(st.out, p...)
+		st.cond.Broadcast()
+	}
+	st.mu.Unlock()
+}
+
+// end marks the peer's mFin (fin) or the stream's death (!fin) for the writer.
+func (st *stream) end(fin bool) {
+	st.mu.Lock()
+	if fin {
+		st.fin = true
+	} else {
+		st.dead = true
+	}
+	st.cond.Broadcast()
+	st.mu.Unlock()
 }
 
 type Mux struct {
@@ -82,8 +127,10 @@ func (m *Mux) Open(addr string, local net.Conn, reply func(ok bool)) error {
 	}
 	m.nextID++
 	id := m.nextID
-	m.streams[id] = &stream{conn: local, reply: reply}
+	st := newStream(local, reply)
+	m.streams[id] = st
 	m.mu.Unlock()
+	go m.writer(id, st)
 	return m.send(id, mOpen, []byte(addr))
 }
 
@@ -98,7 +145,7 @@ func (m *Mux) get(id uint32) *stream {
 func (m *Mux) Run() error {
 	br := bufio.NewReaderSize(m.sess, 64<<10)
 	var hdr [mHdrLen]byte
-	buf := make([]byte, 1<<16) // u16 length field: a payload never exceeds this
+	buf := make([]byte, maxPayload)
 	var err error
 	for {
 		if _, err = io.ReadFull(br, hdr[:]); err != nil {
@@ -123,21 +170,17 @@ func (m *Mux) Run() error {
 				go m.pump(id, st)
 			}
 		case mData:
-			// A blocking write here is the "no per-stream flow control"
-			// limitation: a slow local reader stalls the whole session.
+			// Queue it for the stream's writer and move on. Run blocks only
+			// when that stream's queue is full: the "no per-stream flow
+			// control" limitation.
 			if st := m.get(id); st != nil {
-				if _, werr := st.conn.Write(p); werr != nil {
-					m.reset(id, true)
-				}
+				st.push(p)
 			}
 		case mFin:
-			// Peer finished sending: half-close our local socket so the app
-			// sees EOF while it can still write its own remaining data.
+			// The writer half-closes the local socket after writing all data
+			// that came before the mFin.
 			if st := m.get(id); st != nil {
-				if cw, ok := st.conn.(interface{ CloseWrite() error }); ok {
-					cw.CloseWrite()
-				}
-				m.finish(id, false)
+				st.end(true)
 			}
 		case mRst:
 			m.reset(id, false)
@@ -157,8 +200,10 @@ func (m *Mux) Run() error {
 	return err
 }
 
-// closeStream tells a still-pending SOCKS client "refused", then closes.
+// closeStream stops the writer, tells a still-pending SOCKS client
+// "refused", then closes.
 func closeStream(st *stream) {
+	st.end(false)
 	if st.reply != nil {
 		st.reply(false)
 	}
@@ -172,7 +217,7 @@ func (m *Mux) accept(id uint32, addr string) {
 		m.send(id, mRst, nil)
 		return
 	}
-	st := &stream{conn: c}
+	st := newStream(c, nil)
 	m.mu.Lock()
 	if m.dead { // session died while we were dialing
 		m.mu.Unlock()
@@ -181,6 +226,7 @@ func (m *Mux) accept(id uint32, addr string) {
 	}
 	m.streams[id] = st
 	m.mu.Unlock()
+	go m.writer(id, st)
 	if m.send(id, mOpenOK, nil) == nil {
 		m.pump(id, st)
 	}
@@ -189,8 +235,10 @@ func (m *Mux) accept(id uint32, addr string) {
 // pump copies local socket -> session. During an outage send blocks once the
 // retransmit buffer is full, so we stop reading and the app sees backpressure.
 func (m *Mux) pump(id uint32, st *stream) {
-	// Room for the header in front of the data: no allocation per frame.
-	buf := make([]byte, mHdrLen+maxChunk)
+	// Room for the header in front of the data: no allocation per frame. Each
+	// read takes as much as one frame can carry: fewer, bigger operations
+	// (about a third of the syscalls of 16 KiB reads, see README).
+	buf := make([]byte, mHdrLen+maxPayload)
 	for {
 		n, err := st.conn.Read(buf[mHdrLen:])
 		if n > 0 && m.sendFrame(id, mData, buf[:mHdrLen+n]) != nil {
@@ -205,6 +253,40 @@ func (m *Mux) pump(id uint32, st *stream) {
 			m.reset(id, true)
 			return
 		}
+	}
+}
+
+// writer writes peer data to the local socket: everything queued, in one
+// Write. After the peer's mFin and the data before it, it half-closes the
+// socket so the app sees EOF while it can still write its own data.
+func (m *Mux) writer(id uint32, st *stream) {
+	var spare []byte // swapped with st.out, so Run fills one while we write the other
+	for {
+		st.mu.Lock()
+		for len(st.out) == 0 && !st.fin && !st.dead {
+			st.cond.Wait()
+		}
+		if st.dead {
+			st.mu.Unlock()
+			return
+		}
+		if len(st.out) == 0 { // fin, and everything is written
+			st.mu.Unlock()
+			if cw, ok := st.conn.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			}
+			m.finish(id, false)
+			return
+		}
+		data := st.out
+		st.out = spare[:0]
+		st.cond.Broadcast() // room for Run
+		st.mu.Unlock()
+		if _, err := st.conn.Write(data); err != nil {
+			m.reset(id, true)
+			return
+		}
+		spare = data
 	}
 }
 

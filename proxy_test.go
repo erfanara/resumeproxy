@@ -372,6 +372,34 @@ func TestGraceExpiryClosesLocalThenRecovers(t *testing.T) {
 	})
 }
 
+// Data then FIN: the app must get every byte and then EOF, never an early
+// EOF. The echo target closes as soon as it echoed everything, so its FIN
+// races the last data frames through the proxy.
+func TestHalfCloseAfterBurst(t *testing.T) {
+	eachMux(t, func(t *testing.T, mux, mode string) {
+		if mux == "smux" {
+			// smux v1.5.57: once both sides sent FIN, streamClosed calls
+			// recycleTokens, which drops data still buffered but unread.
+			t.Skip("known smux bug: half-closing both ways drops unread data")
+		}
+		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second}, mux, mode)
+		c := e.dial(t)
+		defer c.Close()
+		data := randBytes(4 << 20)
+		go func() {
+			if _, err := c.Write(data); err != nil {
+				t.Errorf("write: %v", err)
+			}
+			c.(interface{ CloseWrite() error }).CloseWrite()
+		}()
+		c.SetReadDeadline(time.Now().Add(30 * time.Second))
+		got, err := io.ReadAll(c)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("got %d bytes, %v; want all %d bytes, then EOF", len(got), err, len(data))
+		}
+	})
+}
+
 // A stream whose app stops reading must not block the others. This is what
 // per-stream flow control buys, and why smux and yamux exist.
 func TestSlowStreamDoesNotStallOthers(t *testing.T) {

@@ -191,8 +191,8 @@ reconnect.
 
 |                            | `custom` (`mux.go`)                        | `smux`                                      | `yamux`                                         |
 |----------------------------|--------------------------------------------|---------------------------------------------|-------------------------------------------------|
-| Code                       | about 190 lines in this repo               | [xtaci/smux](https://github.com/xtaci/smux), used by kcptun | [hashicorp/yamux](https://github.com/hashicorp/yamux), used by Consul and Nomad |
-| Per-stream flow control    | No: one app that stops reading stalls every stream | Yes (protocol v2, 64 KiB window per stream) | Yes (256 KiB window per stream)                 |
+| Code                       | about 250 lines in this repo               | [xtaci/smux](https://github.com/xtaci/smux), used by kcptun | [hashicorp/yamux](https://github.com/hashicorp/yamux), used by Consul and Nomad |
+| Per-stream flow control    | No: one app that stops reading stalls every stream once its 256 KiB queue is full | Yes (protocol v2, 64 KiB window per stream) | Yes (256 KiB window per stream)                 |
 | Half-close                 | `mFin` frame                               | `CloseWrite`                                | `Close` (in yamux it is a half-close)           |
 | "Server reached the target" | `mOpenOK` / `mRst` frames                 | 1-byte status header from `libmux.go`       | same as smux                                    |
 | Changed for resumption     | nothing                                    | keepalive off                               | keepalive off, write timeout raised, open timeout off |
@@ -252,6 +252,8 @@ its own.
 
 ### Result: batching needs operations in flight
 
+Measured before the data-path changes in the next section:
+
 | `-uring-rings` (`custom` mux) | `std`     | `uring`   | ops per `io_uring_enter` |
 |-------------------------------|-----------|-----------|--------------------------|
 | 1                             | ~590 MB/s | ~390 MB/s | 1.0                      |
@@ -280,10 +282,50 @@ The proxy does not give it that many:
 
 Things that did not help (measured): spinning for 20–100 µs before sleeping,
 so the next request finds the reactor awake (+3%); turning off
-`DEFER_TASKRUN` (same). To gain from batching, the proxy would need many
-operations in flight per reactor, for example pipelined tunnel writes and one
-writer goroutine per local stream. That changes the Mux and Session, not the
-I/O layer.
+`DEFER_TASKRUN` (same).
+
+### Fewer, bigger operations
+
+Since the cost is per operation, the proxy's data path was changed to make
+fewer, bigger ones. The changes are in the Mux and Session, not the I/O layer,
+so they help both backends:
+
+- **One writer goroutine per local stream** (`mux.go`). `Mux.Run` only queues
+  peer data, up to 256 KiB per stream, and moves on to the next frame. The
+  writer writes everything that piled up in one `Write`, and passes the
+  peer's FIN on only after the data before it.
+- **Pipelined tunnel writes** (`session.go`). While one write is on the wire,
+  `Session.Write` keeps appending; the next write packs every pending frame,
+  up to 256 KiB.
+- **64 KiB local reads** (`pump` in `mux.go`). Each read takes as much as one
+  mux frame can carry, instead of 16 KiB.
+
+Syscalls for the same work (20 iterations of the `custom` benchmark, 160 MiB
+each way). Unlike throughput, counts do not depend on CPU speed:
+
+| Mode    | Before  | + writers, pipelined writes | + 64 KiB reads | `io_uring_enter` |
+|---------|---------|-----------------------------|----------------|------------------|
+| `std`   | 131k    | 101k                        | **71k**        |                  |
+| `uring` | 266k    | 250k                        | **82k**        | 107k → 30k       |
+
+The writers and pipelined writes alone barely helped io_uring: with 16 KiB
+reads, every 16 KiB still went through about 8 operations along the chain.
+Bigger reads are what cut the number of operations.
+
+Throughput, before and after in alternating runs on a laptop that was
+throttling (400–700 MHz), so only the change is meaningful:
+
+| Path           | Change          |
+|----------------|-----------------|
+| `custom/uring` | about +38%      |
+| `yamux/uring`  | about +40%      |
+| `custom/std`   | about the same  |
+| `yamux/std`    | about +7%       |
+
+The gap between `uring` and `std` shrank from about 30% to about 10–20%.
+`uring` is still not faster: ops per enter stayed below 1, because a single
+stream still has few operations in flight at once. It just needs far fewer of
+them now.
 
 ### Why not SQPOLL?
 
@@ -407,6 +449,7 @@ example `go test -bench Throughput -uring-rings=1`.
 | `TestMultipleStreamsSurvive`             | 8 parallel streams survive repeated kills                             |
 | `TestGraceExpiryClosesLocalThenRecovers` | Local connection closes only after grace, and new ones work afterward |
 | `TestSlowStreamDoesNotStallOthers`       | A stream whose app stops reading doesn't block others (smux, yamux)   |
+| `TestHalfCloseAfterBurst`                | Data then FIN: the app gets every byte, then EOF, never an early EOF (custom, yamux) |
 | `TestUringNet*`                          | io_uring sockets alone: round trip, deadline, Close wakes Read and Accept, half-close, refused dial, batching |
 
 ### Benchmark
@@ -459,7 +502,8 @@ The same problems, solved elsewhere:
 | Limitation                       | Effect                                                                 |
 |----------------------------------|------------------------------------------------------------------------|
 | No encryption / authentication   | Must run inside a secure transport. Without client authentication the server is an open proxy: anyone who reaches it can use it, including to reach the server's own localhost and LAN |
-| No per-stream flow control in `mux.go` | One local socket that stops reading stalls other streams of the session; `-mux smux` and `-mux yamux` don't have this problem |
+| No per-stream flow control in `mux.go` | One local socket that stops reading stalls other streams of the session once its 256 KiB queue is full; `-mux smux` and `-mux yamux` don't have this problem |
+| smux half-close bug (v1.5.57)    | Once a stream is half-closed both ways, smux drops data it buffered but the app has not read yet (`streamClosed` → `recycleTokens`), so the app can see EOF early. `TestHalfCloseAfterBurst` skips smux for this reason |
 | `-mux` mismatch                  | Not detected: if client and server use different multiplexers, streams just fail |
 | Server restart                   | All sessions are lost; clients start new ones                          |
 | SOCKS5 subset                    | No auth, `CONNECT` only                                                |

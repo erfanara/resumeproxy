@@ -41,6 +41,7 @@ const (
 	frPing        // 2
 
 	maxChunk = 16 << 10
+	maxWrite = 256 << 10       // writeLoop packs frames up to about this much per write
 	helloLen = 4 + 16 + 16 + 8 // "RSP1" | id | token | recvOff u64
 )
 
@@ -343,11 +344,11 @@ func (s *Session) readLoop(c net.Conn, gen uint64) {
 }
 
 // writeLoop is the only writer of one tunnel connection. Each round it packs
-// an ACK (if due) and up to maxChunk of unsent data into one write; if there
-// is neither, it sends a PING.
+// an ACK (if due) and up to maxWrite of unsent data (in maxChunk frames) into
+// one write; if there is neither, it sends a PING.
 func (s *Session) writeLoop(c net.Conn, gen uint64) {
 	defer s.drop(gen)
-	out := make([]byte, 0, maxChunk+16)
+	out := make([]byte, 0, maxWrite+maxChunk+16)
 	for {
 		s.mu.Lock()
 		for s.gen == gen && !s.ackDue && !s.pingDue && s.sendNext == s.sendBase+uint64(s.sendBuf.Len()) {
@@ -363,7 +364,14 @@ func (s *Session) writeLoop(c net.Conn, gen uint64) {
 			out = binary.BigEndian.AppendUint64(out, s.recvOff)
 			s.ackDue = false
 		}
-		if pending := s.sendBuf.Bytes()[s.sendNext-s.sendBase:]; len(pending) > 0 {
+		// Pipelined: while the last write was on the wire, Session.Write kept
+		// appending. Pack every pending frame, up to maxWrite, into this one
+		// write: under load that is many frames per syscall or io_uring op.
+		for len(out) < maxWrite {
+			pending := s.sendBuf.Bytes()[s.sendNext-s.sendBase:]
+			if len(pending) == 0 {
+				break
+			}
 			pending = pending[:min(len(pending), maxChunk)]
 			out = append(out, frData, byte(len(pending)>>8), byte(len(pending)))
 			out = append(out, pending...)
