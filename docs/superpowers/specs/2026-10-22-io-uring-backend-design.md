@@ -1,6 +1,6 @@
 # io_uring backend for the tunnel connection
 
-Date: 2026-10-22. Status: implemented on branch `io-uring`.
+Date: 2026-10-22. Status: implemented, then superseded by `2026-10-22-io-uring-reactor-design.md`.
 
 ## Goal
 
