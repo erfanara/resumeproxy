@@ -154,10 +154,21 @@ func (e *env) attaches() int {
 
 var muxes = []string{"custom", "smux", "yamux"}
 
-// eachMux runs f once per multiplexer; the resumable Session below is the same.
-func eachMux(t *testing.T, f func(t *testing.T, mux string)) {
+// eachMux runs f once per multiplexer and tunnel I/O backend (Config.Uring);
+// the resumable Session in between is the same.
+func eachMux(t *testing.T, f func(t *testing.T, mux string, uring bool)) {
 	for _, mux := range muxes {
-		t.Run(mux, func(t *testing.T) { f(t, mux) })
+		t.Run(mux+"/std", func(t *testing.T) { f(t, mux, false) })
+		t.Run(mux+"/uring", func(t *testing.T) {
+			skipNoUring(t)
+			f(t, mux, true)
+		})
+	}
+}
+
+func skipNoUring(t testing.TB) {
+	if err := uringProbe(); err != nil {
+		t.Skip("io_uring unavailable:", err)
 	}
 }
 
@@ -215,8 +226,8 @@ func randBytes(n int) []byte {
 }
 
 func TestSurvivesRepeatedTunnelKills(t *testing.T) {
-	eachMux(t, func(t *testing.T, mux string) {
-		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second}, mux)
+	eachMux(t, func(t *testing.T, mux string, uring bool) {
+		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second, Uring: uring}, mux)
 		c := socksDial(t, e.socks, e.echo)
 		defer c.Close()
 
@@ -245,8 +256,8 @@ func TestSurvivesRepeatedTunnelKills(t *testing.T) {
 }
 
 func TestSurvivesSilentBlackhole(t *testing.T) {
-	eachMux(t, func(t *testing.T, mux string) {
-		e := setup(t, Config{Heartbeat: 50 * time.Millisecond, Timeout: 200 * time.Millisecond, Grace: 10 * time.Second}, mux)
+	eachMux(t, func(t *testing.T, mux string, uring bool) {
+		e := setup(t, Config{Heartbeat: 50 * time.Millisecond, Timeout: 200 * time.Millisecond, Grace: 10 * time.Second, Uring: uring}, mux)
 		c := socksDial(t, e.socks, e.echo)
 		defer c.Close()
 
@@ -260,8 +271,8 @@ func TestSurvivesSilentBlackhole(t *testing.T) {
 }
 
 func TestMultipleStreamsSurvive(t *testing.T) {
-	eachMux(t, func(t *testing.T, mux string) {
-		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second}, mux)
+	eachMux(t, func(t *testing.T, mux string, uring bool) {
+		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second, Uring: uring}, mux)
 		var wg sync.WaitGroup
 		for i := 0; i < 8; i++ {
 			c := socksDial(t, e.socks, e.echo)
@@ -283,8 +294,8 @@ func TestMultipleStreamsSurvive(t *testing.T) {
 }
 
 func TestGraceExpiryClosesLocalThenRecovers(t *testing.T) {
-	eachMux(t, func(t *testing.T, mux string) {
-		e := setup(t, Config{Heartbeat: 50 * time.Millisecond, Grace: 300 * time.Millisecond}, mux)
+	eachMux(t, func(t *testing.T, mux string, uring bool) {
+		e := setup(t, Config{Heartbeat: 50 * time.Millisecond, Grace: 300 * time.Millisecond, Uring: uring}, mux)
 		c := socksDial(t, e.socks, e.echo)
 		defer c.Close()
 		roundTrip(t, c, []byte("hello"), 0)
@@ -309,11 +320,11 @@ func TestGraceExpiryClosesLocalThenRecovers(t *testing.T) {
 // A stream whose app stops reading must not block the others. This is what
 // per-stream flow control buys, and why smux and yamux exist.
 func TestSlowStreamDoesNotStallOthers(t *testing.T) {
-	eachMux(t, func(t *testing.T, mux string) {
+	eachMux(t, func(t *testing.T, mux string, uring bool) {
 		if mux == "custom" {
 			t.Skip("known limitation: mux.go has no per-stream flow control")
 		}
-		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second}, mux)
+		e := setup(t, Config{Heartbeat: time.Second, Grace: 10 * time.Second, Uring: uring}, mux)
 		slow := socksDial(t, e.socks, e.echo)
 		defer slow.Close()
 		go slow.Write(randBytes(64 << 20)) // echoed back, but never read
@@ -325,8 +336,9 @@ func TestSlowStreamDoesNotStallOthers(t *testing.T) {
 	})
 }
 
-// BenchmarkThroughput echoes 8 MiB per iteration through the whole proxy, with
-// a direct TCP connection to the same echo server as the baseline:
+// BenchmarkThroughput echoes 8 MiB per iteration through the whole proxy, for
+// every multiplexer and tunnel I/O backend, with a direct TCP connection to
+// the same echo server as the baseline:
 //
 //	go test -run '^$' -bench Throughput
 func BenchmarkThroughput(b *testing.B) {
@@ -346,9 +358,14 @@ func BenchmarkThroughput(b *testing.B) {
 		run(b, c)
 	})
 	for _, mux := range muxes {
-		b.Run(mux, func(b *testing.B) {
-			e := setup(b, Config{}, mux)
-			run(b, socksDial(b, e.socks, e.echo))
-		})
+		for _, backend := range []string{"std", "uring"} {
+			b.Run(mux+"/"+backend, func(b *testing.B) {
+				if backend == "uring" {
+					skipNoUring(b)
+				}
+				e := setup(b, Config{Uring: backend == "uring"}, mux)
+				run(b, socksDial(b, e.socks, e.echo))
+			})
+		}
 	}
 }

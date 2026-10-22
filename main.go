@@ -2,11 +2,12 @@
 // TCP connection loss without closing local connections. README.md has usage
 // and the design; the code is layered bottom-up:
 //
-//	session.go  Session: one reliable byte stream that survives tunnel reconnects
-//	mux.go      Mux: many proxied connections ("streams") over one Session
-//	libmux.go   the same job done by smux or yamux, for comparison (-mux)
-//	socks.go    SOCKS5 front end (client)
-//	main.go     Client session holder, target dialer (server), flags
+//	uring_linux.go  tunnel I/O through io_uring instead of Go's netpoller (-io)
+//	session.go      Session: one reliable byte stream that survives tunnel reconnects
+//	mux.go          Mux: many proxied connections ("streams") over one Session
+//	libmux.go       the same job done by smux or yamux, for comparison (-mux)
+//	socks.go        SOCKS5 front end (client)
+//	main.go         Client session holder, target dialer (server), flags
 package main
 
 import (
@@ -80,25 +81,34 @@ func main() {
 	grace := flag.Duration("grace", def.Grace, "how long to keep a session while the tunnel is down")
 	hb := flag.Duration("heartbeat", def.Heartbeat, "heartbeat interval; tunnel is dead after 3 missed")
 	bufMB := flag.Int("buf", def.MaxBuf>>20, "retransmit buffer per direction, MiB")
+	ioMode := flag.String("io", "std", "tunnel I/O: std (Go netpoller) or uring (io_uring, Linux 5.6+)")
 	flag.Parse()
 
 	if *mux != "custom" && *mux != "smux" && *mux != "yamux" {
 		log.Fatal("-mux must be custom, smux or yamux")
 	}
-	cfg := Config{Heartbeat: *hb, Grace: *grace, MaxBuf: *bufMB << 20, Logf: log.Printf}
+	if *ioMode != "std" && *ioMode != "uring" {
+		log.Fatal("-io must be std or uring")
+	}
+	if *ioMode == "uring" {
+		if err := uringProbe(); err != nil { // fail now, not on every reconnect
+			log.Fatal("-io uring: ", err)
+		}
+	}
+	cfg := Config{Heartbeat: *hb, Grace: *grace, MaxBuf: *bufMB << 20, Uring: *ioMode == "uring", Logf: log.Printf}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	switch *mode {
 	case "server":
-		log.Printf("tunnel server on %s (mux: %s)", ln.Addr(), *mux)
+		log.Printf("tunnel server on %s (mux: %s, io: %s)", ln.Addr(), *mux, *ioMode)
 		log.Fatal((&Server{Cfg: cfg, Handler: serverHandler(*mux)}).Serve(ln))
 	case "client":
 		if *server == "" {
 			log.Fatal("-server is required")
 		}
-		log.Printf("SOCKS5 on %s -> %s (mux: %s)", ln.Addr(), *server, *mux)
+		log.Printf("SOCKS5 on %s -> %s (mux: %s, io: %s)", ln.Addr(), *server, *mux, *ioMode)
 		log.Fatal((&Client{Server: *server, Mux: *mux, Cfg: cfg}).ServeSocks(ln))
 	default:
 		log.Fatal("-mode must be client or server")

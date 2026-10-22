@@ -33,6 +33,7 @@ flowchart LR
 
 | Layer   | File         | Responsibility                                                                 |
 |---------|--------------|--------------------------------------------------------------------------------|
+| I/O     | `uring_linux.go` | Optional: the tunnel connection's reads and writes through io_uring, selected with `-io` |
 | Session | `session.go` | One reliable byte stream that outlives the TCP connection carrying it          |
 | Mux     | `mux.go`     | Many proxied connections ("streams") multiplexed over one Session              |
 |         | `libmux.go`  | The same job done by smux or yamux, selected with `-mux`                       |
@@ -71,6 +72,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 | `-grace`     | `60s`            | How long a session is kept while the tunnel is down          |
 | `-heartbeat` | `5s`             | Ping interval; the tunnel counts as dead after 3 missed      |
 | `-buf`       | `4`              | Retransmit buffer per direction, in MiB                      |
+| `-io`        | `std`            | Tunnel I/O: `std` (Go's netpoller) or `uring` (io_uring, Linux 5.6+) |
 
 ## Try it yourself
 
@@ -207,6 +209,76 @@ smux or yamux a second stream keeps working while the first one's app has
 stopped reading. With `mux.go` the whole session stalls, so that subtest is
 skipped.
 
+## I/O backends: std, io_uring
+
+`-io` picks how the tunnel connection (the one TCP connection between proxy
+client and proxy server) does its reads and writes. Local SOCKS and target
+connections always use Go's netpoller. The bytes on the wire are the same,
+so each side can choose on its own.
+
+|                  | `std` (default)                                          | `uring` (`uring_linux.go`)                                   |
+|------------------|----------------------------------------------------------|--------------------------------------------------------------|
+| A read waits by  | nonblocking `read`, parking the goroutine until `epoll` wakes it | one `io_uring_enter` that submits a `RECV` and waits for its completion |
+| Code             | Go standard library                                      | about 290 lines of code, standard library only (`syscall`, `unsafe`) |
+| Platforms        | all                                                      | Linux 5.6+, amd64 and arm64                                  |
+
+How the `uring` backend works:
+
+- `uringConn` implements `net.Conn`, so the Session does not know which
+  backend it runs on. Right after dial or accept it takes over the socket:
+  it duplicates the fd and closes the Go connection.
+- Each connection has two small rings, one for reads and one for writes. The
+  Session has exactly one reader and one writer goroutine, so they never
+  share a queue and no reactor goroutine is needed.
+- Deadlines, which the heartbeat depends on, are a `LINK_TIMEOUT` linked
+  behind the read or write.
+- `Close` calls `shutdown` first: closing the fd does not cancel an operation
+  the kernel is already running.
+- Go's scheduler interrupts threads with `SIGURG`, so `io_uring_enter` often
+  returns `EINTR`. The wait loop recounts what was submitted and completed
+  each time, so nothing is submitted twice.
+
+**Lesson: io_uring is not automatically faster.** This backend still makes
+one syscall per read or write, like the netpoller, and a blocking
+`io_uring_enter` holds an OS thread while it waits. io_uring saves syscalls
+only when many operations share one `io_uring_enter`. That needs one shared
+ring for all sockets and a reactor goroutine, which this PoC leaves out. The
+[benchmark](#benchmark) shows the result: about the same throughput, or a
+little lower. A profile also shows the limit: the tunnel's own I/O is only
+about 20% of the CPU time. The rest goes to the local, relay and target
+connections, which stay on the netpoller, so even free tunnel I/O could gain
+at most about 20–25%.
+
+**Why not SQPOLL?** With `IORING_SETUP_SQPOLL` a kernel thread picks up
+submissions, so submitting needs no syscall. We tried it, and it was about
+30% *slower*:
+
+| Variant (`custom` mux, compared with the plain `uring` backend) | Throughput        |
+|------------------------------------------------------------------|-------------------|
+| SQPOLL, one kernel thread per ring or one shared thread          | about 30% slower  |
+| SQPOLL, plus spinning on the completion queue instead of waiting | about 25% slower  |
+| `IORING_SETUP_COOP_TASKRUN`                                      | the same          |
+
+- **It saves no syscall here.** Each direction has one operation in flight
+  and waits for it. Today one `io_uring_enter` submits *and* waits; SQPOLL
+  removes only the submit, so the wait is still a syscall.
+- **It adds a hop.** The request goes from our thread to the kernel's polling
+  thread on another CPU, and the completion has to wake our thread again.
+  With one operation in flight, every extra microsecond of latency is lost
+  throughput.
+- **The polling threads compete for the CPU.** Four tunnel rings started four
+  kernel threads, using cores the proxy needs. Spinning on the completion
+  queue avoids the wait syscall but keeps a Go P busy, which hurt even more.
+
+SQPOLL pays off when a program keeps many operations in flight and has spare
+cores, for example a server with one ring per core.
+
+**Docker:** the default seccomp profile blocks io_uring, so `-io uring` exits
+at startup with an error. Allow it with `security_opt: [seccomp=unconfined]`
+in `compose.yaml`, or with a custom profile that permits `io_uring_setup` and
+`io_uring_enter`. Some systems also turn io_uring off with the
+`kernel.io_uring_disabled` sysctl.
+
 ## Wire format
 
 ### Session layer (`session.go`)
@@ -278,7 +350,9 @@ go test ./...
 
 The tests put a misbehaving relay between client and server and push data
 through a real SOCKS5 connection to an echo server. Each test runs once per
-multiplexer as a subtest, for example `go test -run 'Kills/yamux' -v`.
+multiplexer and I/O backend as a subtest, for example
+`go test -run 'Kills/yamux/uring' -v`. The `uring` subtests skip, with the
+reason, where io_uring is unavailable.
 
 | Test                                     | What it proves                                                        |
 |------------------------------------------|-----------------------------------------------------------------------|
@@ -287,6 +361,7 @@ multiplexer as a subtest, for example `go test -run 'Kills/yamux' -v`.
 | `TestMultipleStreamsSurvive`             | 8 parallel streams survive repeated kills                             |
 | `TestGraceExpiryClosesLocalThenRecovers` | Local connection closes only after grace, and new ones work afterward |
 | `TestSlowStreamDoesNotStallOthers`       | A stream whose app stops reading doesn't block others (smux, yamux)   |
+| `TestUringConn*`                         | io_uring connection alone: round trip, read deadline, Close wakes a pending Read |
 
 ### Benchmark
 
@@ -295,18 +370,20 @@ go test -run '^$' -bench Throughput
 ```
 
 Echoes 8 MiB per iteration over a direct TCP connection and through the whole
-proxy with each multiplexer. One run on a laptop (i5-1235U):
+proxy with each multiplexer and I/O backend. Best of 3 runs on a laptop
+(i5-1235U):
 
-| Path     | Throughput  |
-|----------|-------------|
-| direct   | ~1950 MB/s  |
-| `custom` | ~260 MB/s   |
-| `smux`   | ~285 MB/s   |
-| `yamux`  | ~310 MB/s   |
+| Path     | `-io std`  | `-io uring` |
+|----------|------------|-------------|
+| direct   | ~1440 MB/s |             |
+| `custom` | ~490 MB/s  | ~455 MB/s   |
+| `smux`   | ~330 MB/s  | ~325 MB/s   |
+| `yamux`  | ~225 MB/s  | ~220 MB/s   |
 
 The proxied path adds three TCP hops (proxy client, test relay, proxy server)
 and several buffer copies. That costs far more than the choice of
-multiplexer. Numbers vary from run to run.
+multiplexer or I/O backend. Numbers vary from run to run, and a laptop that
+throttles can halve them; compare runs taken back to back.
 
 ## Related work
 
@@ -337,6 +414,7 @@ The same problems, solved elsewhere:
 | `-mux` mismatch                  | Not detected: if client and server use different multiplexers, streams just fail |
 | Server restart                   | All sessions are lost; clients start new ones                          |
 | SOCKS5 subset                    | No auth, `CONNECT` only                                                |
+| `-io uring`                      | Linux 5.6+ on amd64 or arm64 only; blocked by Docker's default seccomp profile; no batching, so not faster than `std` |
 
 ## License
 

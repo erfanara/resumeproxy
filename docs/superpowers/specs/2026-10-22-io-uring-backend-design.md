@@ -1,6 +1,6 @@
 # io_uring backend for the tunnel connection
 
-Date: 2026-10-22. Status: approved design, not yet implemented.
+Date: 2026-10-22. Status: implemented on branch `io-uring`.
 
 ## Goal
 
