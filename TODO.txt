@@ -1,0 +1,77 @@
+TODO: future work (state as of 2026-10-22, branch io-uring at 922a6f7)
+
+Benchmarking note: this laptop (i5-1235U) throttles to 400-700 MHz when not
+on the charger, which can halve throughput mid-run. Compare variants in
+alternating runs, and prefer syscall counts for fixed work
+(-test.benchtime 20x under `strace -f -c`), which do not depend on CPU speed.
+
+1. Change the -uring-rings default from 4 to 2
+   - main.go: defaultUringRings. Measured on a cool CPU (custom mux, single
+     runs): 2 rings = 1.36 ops/enter vs 0.76, 18% fewer syscalls, throughput
+     equal or better.
+   - Why: with fewer rings each reactor stays busy and sleeps less, so fewer
+     operations pay for an eventfd write plus an empty wake-up enter.
+
+2. Re-measure and fix the README numbers
+   - Single runs on a cool CPU showed -io uring FASTER than std
+     (custom: 581 vs 555 MB/s with 4 rings, 592 vs 571 with 2 rings). The
+     README still says uring is 10-20% slower (that came from throttled runs).
+   - Confirm with alternating runs, on the charger, then update the
+     "I/O backends" result sections and the main benchmark table
+     (go test -run '^$' -bench Throughput -count 3).
+
+3. Read-ahead with multishot RECV (kernel 6.0+) and a provided buffer ring
+   - Every socket keeps a receive armed; arriving data completes without a
+     submit, several CQEs per enter. Goal: ops/enter well above ~1.4.
+   - Cost: one copy from the kernel-selected buffer into the caller's
+     buffer, buffer-ring registration and recycling, ~150 lines in
+     uringnet_linux.go.
+
+4. Write-behind sends
+   - Write copies into a per-connection buffer and returns; the reactor
+     chains the next SEND straight from the previous completion (no
+     goroutine round trip per send).
+   - Write errors then surface on the next Write or on Close, like TCP
+     itself; Session tolerates that (it retransmits from sendBuf).
+   - Once buffers are owned by the conn, IORING_OP_SEND_ZC becomes possible
+     for large sends over real NICs (no gain on loopback: the kernel copies
+     anyway and reports IORING_NOTIF_USAGE_ZC_COPIED).
+
+5. Cut user-space copies on the data path (helps both backends)
+   - Today a byte is copied ~4 times by the kernel and ~7 times in user
+     space per direction (memmove was ~15% of CPU in profiles).
+   - Send side: SENDMSG with iovecs (frame headers + payload slices straight
+     from the retransmit buffer). Needs memory that does not move while a
+     send is in flight: bytes.Buffer slides and reallocates, so sendBuf
+     would become a ring buffer.
+   - Receive side: parse frames in the receive buffer instead of bufio ->
+     frame buffer -> recvBuf -> bufio -> Mux.Run buffer.
+   - splice / RECV_ZC do not fit: framing and retransmission need the bytes
+     in user space; RECV_ZC needs NIC header/data split support.
+
+6. smux v1.5.57 half-close bug
+   - Once a stream is half-closed in both directions, Session.streamClosed
+     calls recycleTokens, which drops data buffered but not yet read, so the
+     app can see EOF early. Reproduced by TestHalfCloseAfterBurst (skips
+     smux). Draft an upstream issue for xtaci/smux with this reproduction.
+
+7. Per-stream flow control in mux.go
+   - Known limitation: a local app that stops reading stalls every stream of
+     the session once its 256 KiB queue (maxStreamBuf) is full.
+     TestSlowStreamDoesNotStallOthers skips custom for this reason.
+   - Fix would be a per-stream window (credits), like smux v2 and yamux.
+
+8. CI: check that the io_uring subtests really run on GitHub's runners
+   - They skip with a reason if the probe fails; look at a CI log for
+     "io_uring unavailable" and fix the runner setup if needed.
+
+9. Smaller io_uring items
+   - Reactor panics on an unexpected io_uring_enter error (anything but
+     EINTR/EAGAIN/EBUSY); consider failing that reactor's requests instead.
+   - Dial tries resolved addresses one after another (no Happy Eyeballs),
+     and rawSockaddr ignores the IPv6 zone (link-local addresses).
+   - compose.yaml: add an io_uring variant (security_opt: seccomp=unconfined)
+     if containers should run -io uring.
+
+10. Merge the io-uring branch
+   - Not merged into main yet; review and open a PR when items 1-2 are done.
