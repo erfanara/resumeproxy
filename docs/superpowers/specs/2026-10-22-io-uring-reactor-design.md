@@ -1,6 +1,8 @@
 # io_uring for every socket, with batching reactors
 
-Date: 2026-10-22. Status: approved design. Supersedes
+Date: 2026-10-22. Status: implemented; measured 25-30% slower than `std`
+because the proxy keeps about one op in flight per reactor (README, "I/O
+backends"). Supersedes
 `2026-10-22-io-uring-backend-design.md` (one ring per connection, one
 syscall per op, measured no faster than the netpoller).
 

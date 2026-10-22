@@ -54,16 +54,8 @@ type Config struct {
 	Timeout   time.Duration // tunnel is declared dead after this much silence
 	Grace     time.Duration // how long a detached session is kept alive
 	MaxBuf    int           // max buffered bytes per direction (backpressure limit)
-	Uring     bool          // tunnel I/O through io_uring (uring_linux.go) instead of Go's netpoller
+	Net       *Net          // opens tunnel sockets: nil = Go's net, else io_uring reactors (uringnet_linux.go)
 	Logf      func(format string, args ...any)
-}
-
-// tunnelConn hands a fresh tunnel connection to io_uring if c.Uring is set.
-func (c Config) tunnelConn(conn net.Conn) (net.Conn, error) {
-	if !c.Uring {
-		return conn, nil
-	}
-	return newUringConn(conn)
 }
 
 func (c Config) withDefaults() Config {
@@ -449,10 +441,7 @@ func (s *Session) dialLoop(addr string) {
 // connect does the client half of the handshake: send hello with our
 // recvOff, read the server's recvOff, then attach with it.
 func (s *Session) connect(addr string) error {
-	c, err := net.DialTimeout("tcp", addr, s.cfg.Timeout)
-	if err == nil {
-		c, err = s.cfg.tunnelConn(c)
-	}
+	c, err := s.cfg.Net.Dial(addr, s.cfg.Timeout)
 	if err != nil {
 		return err
 	}
@@ -508,11 +497,6 @@ func (sv *Server) Serve(ln net.Listener) error {
 
 // handshake either creates a new session or resumes a known one.
 func (sv *Server) handshake(c net.Conn) {
-	c, err := sv.Cfg.tunnelConn(c)
-	if err != nil {
-		sv.Cfg.Logf("tunnel connection dropped: %v", err)
-		return
-	}
 	c.SetDeadline(time.Now().Add(sv.Cfg.Timeout))
 	var hello [helloLen]byte
 	if _, err := io.ReadFull(c, hello[:]); err != nil || string(hello[:4]) != "RSP1" {

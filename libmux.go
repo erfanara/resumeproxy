@@ -121,7 +121,7 @@ func (lc *libClient) Open(addr string, local net.Conn, reply func(ok bool)) erro
 }
 
 // serveLib is the server side: it serves streams until the Session dies for good.
-func serveLib(mux string, s *Session) {
+func serveLib(mux string, s *Session, dial func(string) (net.Conn, error)) {
 	lm := newLibMux(mux, s, false)
 	defer lm.close()
 	for {
@@ -129,13 +129,13 @@ func serveLib(mux string, s *Session) {
 		if err != nil {
 			return
 		}
-		go serveStream(st)
+		go serveStream(st, dial)
 	}
 }
 
 // serveStream reads the target from the stream header, dials it, reports the
 // result and joins the stream to the target.
-func serveStream(st net.Conn) {
+func serveStream(st net.Conn, dial func(string) (net.Conn, error)) {
 	defer st.Close()
 	var n [2]byte
 	if _, err := io.ReadFull(st, n[:]); err != nil {
@@ -145,7 +145,7 @@ func serveStream(st net.Conn) {
 	if _, err := io.ReadFull(st, addr); err != nil {
 		return
 	}
-	c, err := dialTarget(string(addr))
+	c, err := dial(string(addr))
 	if err != nil {
 		st.Write([]byte{1})
 		return

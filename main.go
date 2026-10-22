@@ -2,7 +2,7 @@
 // TCP connection loss without closing local connections. README.md has usage
 // and the design; the code is layered bottom-up:
 //
-//	uring_linux.go  tunnel I/O through io_uring instead of Go's netpoller (-io)
+//	uring*_linux.go every socket through batching io_uring reactors (-io uring)
 //	session.go      Session: one reliable byte stream that survives tunnel reconnects
 //	mux.go          Mux: many proxied connections ("streams") over one Session
 //	libmux.go       the same job done by smux or yamux, for comparison (-mux)
@@ -56,18 +56,23 @@ func (cl *Client) tunnel() Tunnel {
 	return cl.tun
 }
 
-func dialTarget(addr string) (net.Conn, error) {
-	return net.DialTimeout("tcp", addr, 10*time.Second)
+// defaultUringRings is the -uring-rings default, picked by benchmark (README).
+const defaultUringRings = 4
+
+// targetDialer dials the targets clients ask for, through nw (nil: Go's net).
+func targetDialer(nw *Net) func(string) (net.Conn, error) {
+	return func(addr string) (net.Conn, error) { return nw.Dial(addr, 10*time.Second) }
 }
 
 // serverHandler returns the proxy-server side of one session: a multiplexer
 // that dials whatever target the client asks for.
 func serverHandler(mux string) func(*Session) {
 	return func(s *Session) {
+		dial := targetDialer(s.cfg.Net)
 		if mux == "smux" || mux == "yamux" {
-			serveLib(mux, s)
+			serveLib(mux, s, dial)
 		} else {
-			NewMux(s, dialTarget).Run()
+			NewMux(s, dial).Run()
 		}
 	}
 }
@@ -81,7 +86,8 @@ func main() {
 	grace := flag.Duration("grace", def.Grace, "how long to keep a session while the tunnel is down")
 	hb := flag.Duration("heartbeat", def.Heartbeat, "heartbeat interval; tunnel is dead after 3 missed")
 	bufMB := flag.Int("buf", def.MaxBuf>>20, "retransmit buffer per direction, MiB")
-	ioMode := flag.String("io", "std", "tunnel I/O: std (Go netpoller) or uring (io_uring, Linux 5.6+)")
+	ioMode := flag.String("io", "std", "socket I/O: std (Go netpoller) or uring (io_uring for every socket, Linux 6.1+)")
+	rings := flag.Int("uring-rings", defaultUringRings, "io_uring reactors, each one ring and one thread (with -io uring)")
 	flag.Parse()
 
 	if *mux != "custom" && *mux != "smux" && *mux != "yamux" {
@@ -90,13 +96,15 @@ func main() {
 	if *ioMode != "std" && *ioMode != "uring" {
 		log.Fatal("-io must be std or uring")
 	}
+	var nw *Net // nil: Go's net
 	if *ioMode == "uring" {
-		if err := uringProbe(); err != nil { // fail now, not on every reconnect
+		var err error
+		if nw, err = NewUringNet(*rings); err != nil {
 			log.Fatal("-io uring: ", err)
 		}
 	}
-	cfg := Config{Heartbeat: *hb, Grace: *grace, MaxBuf: *bufMB << 20, Uring: *ioMode == "uring", Logf: log.Printf}
-	ln, err := net.Listen("tcp", *listen)
+	cfg := Config{Heartbeat: *hb, Grace: *grace, MaxBuf: *bufMB << 20, Net: nw, Logf: log.Printf}
+	ln, err := nw.Listen(*listen)
 	if err != nil {
 		log.Fatal(err)
 	}
