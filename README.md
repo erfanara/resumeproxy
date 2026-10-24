@@ -308,6 +308,49 @@ The proxied path adds three TCP hops (proxy client, test relay, proxy server)
 and several buffer copies. That costs far more than the choice of
 multiplexer. Numbers vary from run to run.
 
+## Why not just tune TCP?
+
+A fair question: instead of resuming streams in user space, run a plain
+proxy and tune the kernel's TCP. Raise timeouts so it waits out blackholes,
+drop injected RSTs with netfilter, and use a loss-blind congestion control
+(like TCP Brutal) against throttling. It all runs in the kernel, so it is
+cheaper.
+
+For some attacks, that works:
+
+| Attack                          | Kernel fix                                                                 | Works? |
+|---------------------------------|----------------------------------------------------------------------------|--------|
+| Temporary blackhole             | `TCP_USER_TIMEOUT` or a higher `tcp_retries2`; no short keepalive or app timeouts | Yes: TCP keeps retransmitting and resumes on its own |
+| Injected RSTs                   | `iptables -p tcp --tcp-flags RST RST -j DROP` on **both** ends              | Yes, for the RSTs that reach your hosts |
+| Throttling by random drops      | Loss-blind congestion control on the sending side                          | Mostly |
+
+It fails when the attack kills the connection itself. A TCP connection is
+tied to its 4-tuple (source IP and port, destination IP and port). Once
+that flow is dead, no tuning revives it:
+
+- **Blackholes that never end.** Censors often blackhole one flow, or its
+  3-tuple, for minutes or for good. Tuned TCP keeps retransmitting into
+  nothing. A new connection from a new source port gets through right away.
+- **Boxes in the middle that you don't control.** A home router, carrier NAT
+  or ISP firewall can see a forged RST and delete its own state for the flow.
+  Long blackholes also let NAT state expire. Either way, later packets are
+  dropped or the flow gets a new port.
+- **The client's IP changes** (Wi-Fi to mobile data, DHCP renewal, NAT
+  rebinding). TCP dies by definition.
+- **Throttling that isn't random loss.** Above a hard rate limit, a
+  loss-blind sender just loses more packets. Throttling that grows with a
+  flow's age or size only resets on a new flow.
+- **Practical costs.** You need root and netfilter rules on both ends, plus a
+  kernel module for Brutal. Dropping every RST also drops the real ones, so
+  dead connections pile up until a timeout clears them.
+
+Resumeproxy's redial gets a new 4-tuple and carries the same byte stream
+over to it, which TCP can't do. Doing that in the kernel means MPTCP;
+QUIC does it in user space (see [Related work](#related-work)).
+
+The two approaches combine well: tune the tunnel's TCP so most attacks never
+break it, and keep resumption as the fallback for when it breaks anyway.
+
 ## Related work
 
 The same problems, solved elsewhere:
@@ -322,7 +365,8 @@ The same problems, solved elsewhere:
   transport itself survives a change of network path.
 - **Multipath TCP** ([RFC 8684](https://www.rfc-editor.org/rfc/rfc8684)): one
   connection spread over several TCP subflows; losing one subflow does not
-  break it.
+  break it. Middleboxes can see its TCP options, and can strip them (it then
+  falls back to plain TCP) or fingerprint them.
 - **autossh**: the opposite approach. It restarts the SSH connection, so every
   connection forwarded through it breaks.
 - **HTTP/2 and QUIC streams**: multiplexing many streams over one connection
